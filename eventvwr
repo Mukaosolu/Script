@@ -1,0 +1,112 @@
+@echo off
+setlocal enabledelayedexpansion
+
+:: === INITIAL SETUP ===
+set "timestampFile=last_run_time.txt"
+set "logfile=FilteredAppEvents.txt"
+set "LOG_OUTPUT=email_log.txt"
+set "ZIP_FILE=FilteredAppEvents.zip"
+set "BASE64_JOINED=encoded_base64.txt"
+set "PAYLOAD_FILE=email_payload.json"
+set "RESPONSE_FILE=email_response.txt"
+
+:: === EMAIL CONFIGURATION ===
+set API_URL=https://ip/notification-api/emails/send-mail
+set mailFrom=no-reply@example.com
+set mailTo=""
+set mailCc=""
+set mailSubject=Filtered App Events Log on %COMPUTERNAME%
+
+:: === CLEAN OLD FILES ===
+if exist "%logfile%" del "%logfile%"
+if exist "%LOG_OUTPUT%" del "%LOG_OUTPUT%"
+if exist "%ZIP_FILE%" del "%ZIP_FILE%"
+if exist "%BASE64_JOINED%" del "%BASE64_JOINED%"
+if exist "%PAYLOAD_FILE%" del "%PAYLOAD_FILE%"
+if exist "%RESPONSE_FILE%" del "%RESPONSE_FILE%"
+
+:: === LOAD LAST RUN TIME OR DEFAULT TO 2 HOURS AGO (UTC) ===
+if exist "%timestampFile%" (
+    set /p startTime=<"%timestampFile%"
+) else (
+    for /f "delims=" %%i in ('powershell -Command "(Get-Date).ToUniversalTime().AddHours(-2).ToString('yyyy-MM-ddTHH:mm:ss.fffZ')"') do set "startTime=%%i"
+)
+
+:: === CALCULATE END TIME (startTime + 1 hour UTC) ===
+for /f "delims=" %%i in ('powershell -Command "[datetime]::Parse('%startTime%').AddHours(1).ToString('yyyy-MM-ddTHH:mm:ss.fffZ')"') do set "endTime=%%i"
+
+
+:: === WRITE HEADER ===
+echo === Filtered Application Events === > "%logfile%"
+echo Time window: %startTime% to %endTime% >> "%logfile%"
+echo. >> "%logfile%"
+
+:: === QUERY .NET RUNTIME EVENTS ===
+echo [Querying .NET Runtime Events...] >> "%logfile%"
+wevtutil qe Application /q:"*[System[(Level=2 or Level=3) and (Provider[@Name='.NET Runtime']) and TimeCreated[@SystemTime>='%startTime%' and @SystemTime<'%endTime%']]]" /f:text >> "%logfile%"
+
+:: === QUERY IIS ASPNetCore MODULE V2 EVENTS ===
+echo. >> "%logfile%"
+echo [Querying IIS ASPNetCore Module V2 Events...] >> "%logfile%"
+wevtutil qe Application /q:"*[System[(Level=2 or Level=3) and (Provider[@Name='IIS ASPNetCore Module V2']) and TimeCreated[@SystemTime>='%startTime%' and @SystemTime<'%endTime%']]]" /f:text >> "%logfile%"
+
+echo. >> "%logfile%"
+echo === End of Log === >> "%logfile%"
+
+:: === ZIP THE LOG FILE ===
+powershell -Command "Compress-Archive -Path 'FilteredAppEvents.txt' -DestinationPath '%ZIP_FILE%' -Force"
+
+:: === BASE64 ENCODE THE ZIP ===
+powershell -Command "[Convert]::ToBase64String([IO.File]::ReadAllBytes('%ZIP_FILE%'))" > "%BASE64_JOINED%"
+
+:: === BUILD JSON PAYLOAD ===
+powershell -Command ^
+  "$b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes('%ZIP_FILE%'));" ^
+  "$attachment = @{ fileData = $b64; fileExt = '.zip'; fileName = 'FilteredAppEvents' };" ^
+  "$payload = [ordered]@{" ^
+    "mailFrom = '%mailFrom%';" ^
+    "mailTo = '%mailTo%';" ^
+    "mailCc = '%mailCc%';" ^
+    "mailBcc = ''; " ^
+    "mailSubject = '%mailSubject%';" ^
+    "mailBody = 'See attached filtered application events log.';" ^
+    "attachments = @($attachment);" ^
+    "isSensitive = $true" ^
+  "};" ^
+  "$payload | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 '%PAYLOAD_FILE%'"
+
+
+
+
+echo [DEBUG] Payload preview: >> "%LOG_OUTPUT%"
+type "%PAYLOAD_FILE%" >> "%LOG_OUTPUT%"
+
+
+:: === SEND EMAIL VIA API ===
+echo [INFO] Sending payload to API... >> "%LOG_OUTPUT%"
+curl -X POST "%API_URL%" ^
+     -H "Content-Type: application/json" ^
+     -d "@%PAYLOAD_FILE%" ^
+     --insecure ^
+     --max-time 15 ^
+     -o "%RESPONSE_FILE%" ^
+     -w "[INFO] HTTP Status: %%{http_code}\n" >> "%LOG_OUTPUT%" 2>&1
+
+:: === CHECK RESPONSE ===
+if exist "%RESPONSE_FILE%" (
+    echo [INFO] Response from API: >> "%LOG_OUTPUT%"
+    type "%RESPONSE_FILE%" >> "%LOG_OUTPUT%"
+) else (
+    echo [ERROR] No response received from API. >> "%LOG_OUTPUT%"
+)
+
+:: === UPDATE LAST RUN TIME ===
+echo %endTime% > "%timestampFile%"
+
+:: === CLEAN UP ===
+del "%ZIP_FILE%" >nul 2>&1
+del "%BASE64_JOINED%" >nul 2>&1
+del "%PAYLOAD_FILE%" >nul 2>&1
+
+echo Done! Filtered events emailed successfully.
+pause
