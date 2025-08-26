@@ -1,0 +1,246 @@
+@echo off
+setlocal EnableDelayedExpansion
+
+:: === SET WORKING DIRECTORY ===
+:: Set working directory to script's location and remove trailing backslash if present
+set "WORKDIR=%~dp0"
+if "%WORKDIR:~-1%"=="\" set "WORKDIR=%WORKDIR:~0,-1%"
+
+echo [DEBUG] Script directory: %WORKDIR% > "%WORKDIR%\debug_trace.log"
+
+
+:: === TIMESTAMP START ===
+for /f %%i in ('powershell -Command "Get-Date -Format yyyy-MM-ddTHH:mm:ss"') do set "START_TIME=%%i"
+
+:: === CONFIGURATION ===
+set "LOG_FILE=Microsoft-Windows-TaskScheduler/Operational"
+set "RAW_LOG=%WORKDIR%\events_raw.txt"
+set "LOG_OUTPUT=%WORKDIR%\task_watcher.log"
+set "LAST_FILE=%WORKDIR%\last_event.txt"
+set "RESPONSE_FILE=%WORKDIR%\response_from_api.txt"
+set "ENCODE_SOURCE=%WORKDIR%\log_copy.txt"
+set "ENCODED_FILE=%WORKDIR%\encoded_log.b64"
+set "STRIPPED_FILE=%WORKDIR%\encoded_clean.txt"
+set "BASE64_JOINED=%WORKDIR%\base64_joined.txt"
+set "PAYLOAD_FILE=%WORKDIR%\payload.json"
+set "LAST_HASH_FILE=%WORKDIR%\last_event_hash.txt"
+set "CURRENT_HASH_FILE=%WORKDIR%\current_event_hash.txt"
+set "ZIP_FILE=%WORKDIR%\log_copy.zip"
+set HRS_BACK=1
+
+:: === EMAIL CONFIGURATION ===
+set API_URL=https://ip/notification-api/emails/send-mail
+set mailFrom=no-reply@example.com
+set mailTo=""
+set mailCc=""
+set mailSubject= Task Scheduler Log Alert on %COMPUTERNAME%
+
+:: === LOG HEADER ===
+echo ============================================ > "%RAW_LOG%"
+echo === Task Scheduler Warnings/Errors Report ===>> "%RAW_LOG%"
+echo ============================================>> "%RAW_LOG%"
+echo [1] Timestamp: %DATE% %TIME%>> "%RAW_LOG%"
+
+:: === LOAD LAST RUN TIME OR DEFAULT TO 2 HOURS AGO (UTC) ===
+if exist "%LAST_FILE%" (
+    set /p SINCE=<"%LAST_FILE%"
+    for /f "delims=" %%T in ("!SINCE!") do set "SINCE=%%T"
+    echo !SINCE! | findstr /R "^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$" >nul || (
+        echo [ERROR] Invalid timestamp in %LAST_FILE%, falling back >> "%LOG_OUTPUT%"
+        for /f %%i in ('powershell -Command "(Get-Date).ToUniversalTime().AddHours(-2).ToString('yyyy-MM-ddTHH:mm:ss')"') do set SINCE=%%i
+    )
+) else (
+    for /f %%i in ('powershell -Command "(Get-Date).ToUniversalTime().AddHours(-2).ToString('yyyy-MM-ddTHH:mm:ss')"') do set SINCE=%%i
+)
+
+:: === CALCULATE END TIME (NOW - 1 HOUR, UTC) ===
+for /f %%i in ('powershell -Command "(Get-Date).ToUniversalTime().AddHours(-1).ToString('yyyy-MM-ddTHH:mm:ss')"') do set UNTIL=%%i
+
+echo [INFO] Using UTC window: %SINCE% to %UNTIL% >> "%LOG_OUTPUT%"
+
+
+:: === GET MATCHING EVENTS WITHIN TIME WINDOW ===
+wevtutil qe "%LOG_FILE%" /f:text /q:"*[System[(Level=2 or Level=3) and TimeCreated[@SystemTime>='%SINCE%' and @SystemTime<'%UNTIL%']]]" >> "%RAW_LOG%" 2>&1
+
+:: === APPEND RAW LOG CONTENT TO MAIN LOG ===
+type "%RAW_LOG%" >> "%LOG_OUTPUT%"
+
+:: === GENERATE HASH OF CURRENT RAW LOG ===
+certutil -hashfile "%RAW_LOG%" SHA256 > "%CURRENT_HASH_FILE%" 2>nul
+for /f "skip=1 tokens=1" %%H in ('type "%CURRENT_HASH_FILE%"') do (
+    set "CURRENT_HASH=%%H"
+    goto got_hash
+)
+:got_hash
+
+
+:: === EXTRACT FIRST FULL DATE STRING (UTC) USING POWERSHELL ===
+for /f "delims=" %%i in ('powershell -Command ^
+  "Get-Content -Path '%RAW_LOG%' | Where-Object { $_ -match '^ *Date:' } | Select-Object -First 1 | ForEach-Object { ($_ -split ':',2)[1].Trim() -replace '\..*Z$','' }"') do (
+    set "latestUTC=%%i"
+)
+
+
+
+if defined latestUTC (
+    echo !latestUTC! > "%LAST_FILE%"
+    echo [INFO] Updated last checked timestamp to: !latestUTC! >> "%LOG_OUTPUT%"
+) else (
+    echo [WARN] No valid timestamp found in log. >> "%LOG_OUTPUT%"
+)
+
+:: === COUNT EVENTS ===
+for /f %%C in ('findstr /C:"Event[" "%RAW_LOG%" ^| find /c /v ""') do set EventCount=%%C
+echo [INFO] Event count = !EventCount! >> "%LOG_OUTPUT%"
+echo [DEBUG] Checking if EventCount (!EventCount!) is greater than 0 >> "%LOG_OUTPUT%"
+set "ECHECK=!EventCount!"
+
+:: === HANDLE CASE: NO NEW EVENTS ===
+if !ECHECK! EQU 0 (
+    echo [INFO] No new events found. >> "%LOG_OUTPUT%"
+    echo No new events found.
+    if defined latestUTC (
+        echo !latestUTC! > "%LAST_FILE%"
+        echo [INFO] Updated last checked timestamp to: !latestUTC! >> "%LOG_OUTPUT%"
+    )
+    goto skip_payload
+)
+
+
+:: === CHECK IF EVENT LOG HAS CHANGED ===
+if exist "%LAST_HASH_FILE%" (
+    set /p LAST_HASH=<"%LAST_HASH_FILE%"
+    if /i "!CURRENT_HASH!"=="!LAST_HASH!" (
+        echo [INFO] No new unique events since last run. Skipping payload. >> "%LOG_OUTPUT%"
+        goto skip_payload
+    )
+)
+
+
+if %ECHECK% GTR 0 (
+    echo [INFO] Preparing to encode log file... >> "%LOG_OUTPUT%"
+
+    :: === COPY LOG FILE TO AVOID FILE LOCK ===
+    echo [DEBUG] Copying log file to avoid sharing violation... >> "%LOG_OUTPUT%"
+    copy /y "%LOG_OUTPUT%" "%ENCODE_SOURCE%" >nul
+    if not exist "%ENCODE_SOURCE%" (
+        echo [ERROR] Failed to copy log file. >> "%LOG_OUTPUT%"
+        goto skip_payload
+    )
+
+    :: === COMPRESS LOG FILE TO ZIP ===
+    if exist "%ZIP_FILE%" del "%ZIP_FILE%" >nul 2>&1
+    powershell -Command "Compress-Archive -Path '%ENCODE_SOURCE%' -DestinationPath '%ZIP_FILE%'"
+    if not exist "%ZIP_FILE%" (
+        echo [ERROR] Failed to create ZIP archive. >> "%LOG_OUTPUT%"
+        goto skip_payload
+    )
+
+    :: === ENCODE ZIP FILE TO BASE64 ===
+    if exist "%ENCODED_FILE%" del "%ENCODED_FILE%" >nul 2>&1
+    certutil -encode "%ZIP_FILE%" "%ENCODED_FILE%" >> "%LOG_OUTPUT%" 2>&1
+    if not exist "%ENCODED_FILE%" (
+        echo [ERROR] certutil failed to create encoded file. >> "%LOG_OUTPUT%"
+        goto skip_payload
+    )
+
+    :: === STRIP HEADER AND FOOTER ===
+    echo [INFO] Stripping base64 header/footer... >> "%LOG_OUTPUT%"
+    (for /f "skip=1 delims=" %%L in (%ENCODED_FILE%) do (
+        if not "%%L"=="-----END CERTIFICATE-----" echo %%L
+    )) > "%STRIPPED_FILE%"
+
+    if not exist "%STRIPPED_FILE%" (
+        echo [ERROR] encoded_clean.txt was NOT created. >> "%LOG_OUTPUT%"
+        goto skip_payload
+    )
+
+    :: === JOIN BASE64 LINES INTO ONE STRING ===
+    break > "%BASE64_JOINED%"
+    for /f "delims=" %%L in (%STRIPPED_FILE%) do (
+        set "line=%%L"
+        <nul set /p=!line!>>"%BASE64_JOINED%"
+    )
+
+    if not exist "%BASE64_JOINED%" (
+        echo [ERROR] base64_joined.txt was NOT created. >> "%LOG_OUTPUT%"
+        goto skip_payload
+    )
+
+
+:: === BUILD JSON PAYLOAD USING POWERSHELL ===
+echo [INFO] Building JSON payload using PowerShell... >> "%LOG_OUTPUT%"
+
+:: Check if PowerShell is available
+where powershell >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] PowerShell is not available. Cannot build JSON payload. >> "%LOG_OUTPUT%"
+    goto skip_payload
+)
+
+powershell -Command ^
+  "$b64 = [System.IO.File]::ReadAllText('%BASE64_JOINED%');" ^
+  "$json = [ordered]@{" ^
+    "mailFrom='%mailFrom%';" ^
+    "mailTo='%mailTo%';" ^
+    "mailCc='%mailCc%';" ^
+    "mailBcc='string';" ^
+    "mailSubject='%mailSubject%';" ^
+    "mailBody='See attached log archive.';" ^
+    "attachments=@(@{fileData=$b64; fileExt='.zip'; fileName='task_watcher_log'});" ^
+    "isSensitive=$true" ^
+  "};" ^
+  "$json | ConvertTo-Json -Depth 3 | Set-Content -Encoding UTF8 '%PAYLOAD_FILE%'" >> "%LOG_OUTPUT%" 2>&1
+
+
+if not exist "%PAYLOAD_FILE%" (
+    echo [ERROR] Failed to create JSON payload. >> "%LOG_OUTPUT%"
+    goto skip_payload
+)
+
+echo [INFO] Payload created successfully. >> "%LOG_OUTPUT%"
+for %%F in ("%PAYLOAD_FILE%") do echo [INFO] Payload size: %%~zF bytes >> "%LOG_OUTPUT%"
+echo [DEBUG] Payload preview: >> "%LOG_OUTPUT%"
+echo [DEBUG] Payload file created at: %PAYLOAD_FILE% >> "%LOG_OUTPUT%"
+
+
+
+:: === SEND PAYLOAD VIA CURL ===
+echo [INFO] Sending payload to API... >> "%LOG_OUTPUT%"
+curl -X POST "%API_URL%" ^
+     -H "Content-Type: application/json" ^
+     -d "@%PAYLOAD_FILE%" ^
+     --insecure ^
+     --max-time 15 ^
+     -o "%RESPONSE_FILE%" ^
+     -w "[INFO] HTTP Status: %%{http_code}\n" >> "%LOG_OUTPUT%" 2>&1
+
+:: === CHECK RESPONSE ===
+if exist "%RESPONSE_FILE%" (
+    echo [INFO] Response from API: >> "%LOG_OUTPUT%"
+    type "%RESPONSE_FILE%" >> "%LOG_OUTPUT%"
+) else (
+    echo [ERROR] No response received from API. >> "%LOG_OUTPUT%"
+)
+
+:: === SAVE CURRENT HASH ===
+echo !CURRENT_HASH! > "%LAST_HASH_FILE%"
+
+	
+    :: === CLEAN UP ===
+    del "%ENCODED_FILE%" >nul 2>&1
+    del "%STRIPPED_FILE%" >nul 2>&1
+    del "%BASE64_JOINED%" >nul 2>&1
+    del "%ENCODE_SOURCE%" >nul 2>&1
+    del "%ZIP_FILE%" >nul 2>&1
+)
+
+:: === SAVE END TIME AS NEW START TIME FOR NEXT RUN ===
+echo %UNTIL% > "%LAST_FILE%"
+echo [INFO] Updated last checked timestamp to: %UNTIL% >> "%LOG_OUTPUT%"
+
+:skip_payload
+for /f %%i in ('powershell -Command "Get-Date -Format yyyy-MM-ddTHH:mm:ss"') do set "END_TIME=%%i"
+echo [INFO] Script started at: %START_TIME% >> "%LOG_OUTPUT%"
+echo [INFO] Script ended at:   %END_TIME% >> "%LOG_OUTPUT%"
+echo ====== [%
